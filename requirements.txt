@@ -1,0 +1,42 @@
+# Core data science
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+
+# Preferred model backend
+xgboost>=2.0.0
+
+# CGM-specific libraries
+cgmquantify-updated>=0.5.3
+glucostats>=1.0.0
+
+# Time series and deep learning
+darts[torch]==0.43.0
+statsforecast>=1.7.8
+torch>=2.0.0
+pytorch-lightning>=2.0.0,<2.5.3
+tensorboardx>=2.1
+tsfresh>=0.20.0
+
+# Explainability
+shap>=0.44.0
+lime>=0.2.0
+interpret>=0.4.0
+
+# Federated learning
+flwr>=1.7.0
+
+# API and dashboard
+fastapi>=0.104.0
+uvicorn>=0.24.0
+streamlit>=1.28.0
+plotly>=5.18.0
+python-multipart>=0.0.9
+
+# Config and privacy
+PyYAML>=6.0.1
+diffprivlib>=0.6.0
+
+# Testing
+pytest>=8.0.0
+httpx>=0.27.0

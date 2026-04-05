@@ -1,0 +1,26 @@
+data:
+  resample_rule: "5min"
+  interpolation_limit: 9
+  window_size: 24
+  horizon_steps: 6
+  hypo_threshold: 70.0
+  severe_threshold: 54.0
+  demo_days: 14
+
+model:
+  strict_mode: true
+  n_splits: 5
+  gap: 72
+  random_state: 42
+  prefer_tft: true
+  classifier_weight: 0.65
+  forecast_weight: 0.35
+  high_risk_threshold: 0.7
+  medium_risk_threshold: 0.4
+  ood_quantile: 0.995
+  minimum_real_patients: 2
+  artifact_dir: "artifacts/current"
+
+api:
+  title: "GlycoGuard API"
+  version: "0.1.0"
