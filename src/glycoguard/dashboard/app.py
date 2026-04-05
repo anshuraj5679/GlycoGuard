@@ -170,6 +170,45 @@ def _hex_to_rgba(hex_color: str, alpha: float) -> str:
     return f"rgba({red},{green},{blue},{alpha})"
 
 
+def _display_risk_score(prediction: dict[str, object]) -> float | None:
+    if prediction.get("status", "ok") != "ok":
+        return None
+
+    score = float(prediction.get("hypo_probability") or 0.0)
+    risk_level = str(prediction.get("risk_level") or "UNKNOWN")
+    forecast = prediction.get("predicted_glucose_30min")
+    roc_15 = float(prediction.get("roc_15") or 0.0)
+    current_glucose = prediction.get("current_glucose")
+
+    if current_glucose is not None and float(current_glucose) < 54.0:
+        score = max(score, 0.99)
+
+    if forecast is not None:
+        forecast_value = float(forecast)
+        if forecast_value < 54.0:
+            score = max(score, 0.99)
+        elif forecast_value < 70.0:
+            score = max(score, 0.85)
+        elif forecast_value < 80.0:
+            score = max(score, 0.60)
+        elif forecast_value < 90.0 and roc_15 <= -2.0:
+            score = max(score, 0.45)
+        elif forecast_value < 90.0 and roc_15 <= -1.0:
+            score = max(score, 0.35)
+
+    if risk_level == "HIGH":
+        score = max(score, 0.80)
+    elif risk_level == "MEDIUM":
+        score = max(score, 0.50)
+
+    return max(0.0, min(1.0, score))
+
+
+def _display_risk_label(prediction: dict[str, object]) -> str:
+    score = _display_risk_score(prediction)
+    return "unknown" if score is None else f"{score * 100:.1f}%"
+
+
 def parse_glucose_readings(raw_text: str) -> list[float]:
     tokens = [token.strip() for token in raw_text.replace("\n", ",").split(",")]
     values = [float(token) for token in tokens if token]
@@ -219,7 +258,11 @@ def _profile_seed(report: dict[str, object] | None) -> dict[str, object]:
 
 def _watch_preview_payload(report: dict[str, object] | None) -> dict[str, object]:
     if report is not None and report.get("watch"):
-        return dict(report["watch"])
+        payload = dict(report["watch"])
+        prediction = report.get("prediction")
+        if isinstance(prediction, dict):
+            payload.setdefault("display_risk_score", _display_risk_score(prediction))
+        return payload
     if report is not None and {"risk", "trend", "reason"}.issubset(report.keys()):
         return dict(report)
     return {
@@ -232,6 +275,7 @@ def _watch_preview_payload(report: dict[str, object] | None) -> dict[str, object
         "forecast_30min": None,
         "forecast_warning": "",
         "hypo_probability": None,
+        "display_risk_score": None,
         "top_reason": "Waiting for validated risk signals.",
         "watch_status": "Prediction unavailable",
         "updated_at": datetime.now().isoformat(),
@@ -514,9 +558,9 @@ def _watch_preview_html(payload: dict[str, object]) -> str:
     forecast_warning = str(payload.get("forecast_warning") or "")
     reason = str(payload.get("top_reason") or payload.get("reason") or "Check dashboard")
     watch_status = str(payload.get("watch_status") or "Prediction unavailable")
-    probability = payload.get("hypo_probability")
-    probability_pct = 0.0 if probability in (None, "") else max(0.0, min(100.0, float(probability) * 100.0))
-    probability_label = "unknown" if probability in (None, "") else f"{probability_pct:.0f}%"
+    display_risk_score = payload.get("display_risk_score")
+    probability_pct = 0.0 if display_risk_score in (None, "") else max(0.0, min(100.0, float(display_risk_score) * 100.0))
+    probability_label = "unknown" if display_risk_score in (None, "") else f"{probability_pct:.0f}%"
     watch_color = "#94a3b8" if risk == "UNKNOWN" else risk_color
     risk_strip = "".join(
         (
@@ -555,7 +599,7 @@ def _watch_preview_html(payload: dict[str, object]) -> str:
             </div>
             <div>
                 <div style="display:flex;justify-content:space-between;align-items:center;font-size:0.82rem;color:#94a3b8;">
-                    <span>Hypo probability</span>
+                    <span>Risk score</span>
                     <span>{escape(probability_label)}</span>
                 </div>
                 <div style="height:8px;background:rgba(148,163,184,0.18);border-radius:999px;overflow:hidden;margin-top:0.35rem;">
@@ -604,6 +648,7 @@ def _active_watch_payload(
         "forecast_30min": prediction.get("predicted_glucose_30min"),
         "forecast_warning": str(prediction.get("forecast_warning") or ""),
         "hypo_probability": prediction.get("hypo_probability"),
+        "display_risk_score": _display_risk_score(prediction),
         "top_reason": str(prediction.get("top_reason") or _watch_reason_from_prediction(prediction)),
         "watch_status": str(prediction.get("watch_status") or "Prediction unavailable"),
         "updated_at": (timestamp or datetime.now()).isoformat(),
@@ -918,7 +963,7 @@ def _render_daily_user_mode(service, report: dict[str, object]) -> None:
     col1.metric("Current glucose", f"{active_readings[-1]:.1f} mg/dL")
     col2.metric(
         "Risk score",
-        "unknown" if active_prediction.get("hypo_probability") is None else f'{active_prediction["hypo_probability"] * 100:.1f}%',
+        _display_risk_label(active_prediction),
     )
     col3.metric(
         "30-min forecast",
@@ -934,7 +979,7 @@ def _render_daily_user_mode(service, report: dict[str, object]) -> None:
     bottom_left, bottom_right = st.columns([1.0, 1.2])
     with bottom_left:
         st.plotly_chart(
-            _gauge_figure(float(active_prediction.get("hypo_probability") or 0.0), active_prediction.get("risk_level")),
+            _gauge_figure(float(_display_risk_score(active_prediction) or 0.0), active_prediction.get("risk_level")),
             width="stretch",
         )
     with bottom_right:
@@ -980,7 +1025,7 @@ def _gauge_figure(probability: float, risk_level: str) -> go.Figure:
                     {"range": [70, 100], "color": "rgba(180,35,24,0.18)"},
                 ],
             },
-            title={"text": "Hypoglycaemia risk"},
+            title={"text": "Risk score"},
         )
     )
     fig.update_layout(height=280, margin={"l": 10, "r": 10, "t": 40, "b": 10}, paper_bgcolor="rgba(0,0,0,0)")
@@ -1159,14 +1204,14 @@ def main() -> None:
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Current glucose", f'{report["current_glucose"]} mg/dL')
     col2.metric("15-min delta", f'{report["roc_15"]} mg/dL')
-    col3.metric("Risk score", f'{prediction["hypo_probability"] * 100:.1f}%')
+    col3.metric("Risk score", _display_risk_label(prediction))
     col4.metric("30-min forecast", f'{prediction["predicted_glucose_30min"]} mg/dL')
 
     left, right = st.columns([2.2, 1.0])
     with left:
         st.plotly_chart(_trace_figure(report), width="stretch")
     with right:
-        st.plotly_chart(_gauge_figure(prediction["hypo_probability"], prediction["risk_level"]), width="stretch")
+        st.plotly_chart(_gauge_figure(float(_display_risk_score(prediction) or 0.0), prediction["risk_level"]), width="stretch")
         st.markdown("### Why the alert fired")
         st.caption(prediction["explanation"])
         st.write(

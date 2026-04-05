@@ -5,6 +5,7 @@ import pytest
 from glycoguard.dashboard.app import (
     _active_watch_payload,
     _daily_guidance,
+    _display_risk_score,
     _forecast_only_figure,
     _friendly_top_factors,
     _profile_seed,
@@ -118,6 +119,22 @@ def test_active_watch_payload_uses_live_prediction_state() -> None:
     assert "Glucose dropping" in payload["reason"]
     assert payload["forecast_warning"] == "Predicted to cross 70 mg/dL threshold"
     assert payload["watch_status"] == "Watch buzz triggered - eat 15g carbs now"
+    assert payload["display_risk_score"] == 0.85
+
+
+def test_display_risk_score_reflects_forecast_and_trend_when_probability_is_low() -> None:
+    score = _display_risk_score(
+        {
+            "status": "ok",
+            "hypo_probability": 0.0,
+            "risk_level": "MEDIUM",
+            "predicted_glucose_30min": 76.0,
+            "roc_15": -1.4,
+            "current_glucose": 95.0,
+        }
+    )
+
+    assert score == 0.6
 
 
 def test_forecast_only_figure_hides_recent_glucose_line() -> None:
