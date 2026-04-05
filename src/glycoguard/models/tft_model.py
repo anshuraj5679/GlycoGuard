@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import pickle
+from pathlib import Path
 from typing import Sequence
 from contextlib import contextmanager
 import logging
@@ -131,6 +133,50 @@ class DartsTFTForecaster:
             )
         self.training_columns = ["carbs_1h", "activity", "insulin_on_board", "sleep_flag", "stress_score"]
         self.dataloader_kwargs = {"pin_memory": False, "num_workers": 0}
+
+    def save(self, directory: str | Path) -> None:
+        target_dir = Path(directory)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        with (target_dir / "state.pkl").open("wb") as handle:
+            pickle.dump(
+                {
+                    "horizon_steps": self.horizon_steps,
+                    "random_state": self.random_state,
+                    "backend": self.backend,
+                    "target_scaler": self.target_scaler,
+                    "training_columns": self.training_columns,
+                    "dataloader_kwargs": self.dataloader_kwargs,
+                },
+                handle,
+            )
+        with _suppress_tft_runtime_noise():
+            self.model.save(str(target_dir / "model.pt"), clean=False)
+
+    @classmethod
+    def load(cls, directory: str | Path) -> "DartsTFTForecaster":
+        target_dir = Path(directory)
+        with (target_dir / "state.pkl").open("rb") as handle:
+            state = pickle.load(handle)
+        forecaster = cls.__new__(cls)
+        forecaster.horizon_steps = state["horizon_steps"]
+        forecaster.random_state = state["random_state"]
+        forecaster.backend = state.get("backend", "darts_tft")
+        forecaster.target_scaler = state["target_scaler"]
+        forecaster.training_columns = state["training_columns"]
+        forecaster.dataloader_kwargs = state["dataloader_kwargs"]
+        with _suppress_tft_runtime_noise():
+            forecaster.model = TFTModel.load(
+                str(target_dir / "model.pt"),
+                map_location="cpu",
+                pl_trainer_kwargs={
+                    "accelerator": "cpu",
+                    "devices": 1,
+                    "enable_model_summary": False,
+                    "enable_progress_bar": False,
+                    "logger": False,
+                },
+            )
+        return forecaster
 
     def _covariates_from_frame(self, frame: pd.DataFrame) -> "TimeSeries":
         cov_frame = frame.copy()

@@ -127,11 +127,16 @@ class ReplayStartRequest(BaseModel):
 class WatchPayloadResponse(BaseModel):
     patient_id: str
     glucose: float
+    roc_15: Optional[float] = None
     trend: str
     risk: str
     reason: str
     buzz: bool
     forecast_30min: Optional[float] = None
+    forecast_warning: str = ""
+    hypo_probability: Optional[float] = None
+    top_reason: str = ""
+    watch_status: str = ""
     updated_at: str
     status: str = "live"
     session_id: Optional[str] = None
@@ -167,15 +172,24 @@ class WaterfallPayload(BaseModel):
 class PredictionResponse(BaseModel):
     patient_id: str
     status: str = "ok"
+    current_glucose: Optional[float] = None
+    roc_15: Optional[float] = None
     hypo_probability: Optional[float] = None
     classifier_probability: Optional[float] = None
     forecast_probability: Optional[float] = None
     risk_level: Optional[str] = None
+    prob_risk: Optional[str] = None
+    forecast_risk: Optional[str] = None
     predicted_glucose_30min: Optional[float] = None
     forecast_trace: List[float] = Field(default_factory=list)
     forecast_lower: List[float] = Field(default_factory=list)
     forecast_upper: List[float] = Field(default_factory=list)
+    forecast_notice: Optional[str] = None
     alert_required: bool
+    watch_buzz: bool = False
+    forecast_warning: str = ""
+    top_reason: str = ""
+    watch_status: str = ""
     model_backend: str
     forecast_backend: str
     confidence: Optional[float] = None
@@ -214,6 +228,15 @@ class BundleIngestRequest(BaseModel):
 
 class ArtifactRequest(BaseModel):
     directory: Optional[str] = None
+
+
+class AuditRequest(BaseModel):
+    patient_id: Optional[str] = None
+    payload: Optional[CGMInput] = None
+    current_glucose: Optional[float] = None
+    use_gemini: bool = False
+    model: Optional[str] = None
+    timeout_seconds: float = 30.0
 
 
 class OhioBenchmarkRequest(BaseModel):

@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 
+from glycoguard.gemini_audit import run_prediction_audit
 from glycoguard.service import get_service
 
 
@@ -52,6 +53,16 @@ def _terminate_processes(processes: list[subprocess.Popen[bytes]]) -> None:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 process.kill()
+
+
+def _json_default(value: object) -> object:
+    if hasattr(value, "item") and callable(value.item):
+        return value.item()
+    if hasattr(value, "tolist") and callable(value.tolist):
+        return value.tolist()
+    if hasattr(value, "isoformat") and callable(value.isoformat):
+        return value.isoformat()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def serve(api_port: int = 8000, dashboard_port: int = 8501, separate_windows: bool = False) -> None:
@@ -132,6 +143,14 @@ def build_parser() -> argparse.ArgumentParser:
     federated_parser.add_argument("--rounds", type=int, default=3)
     federated_parser.add_argument("--min-clients", type=int, default=2)
 
+    audit_parser = subparsers.add_parser("audit-prediction", help="Audit model output and optionally review it with Gemini.")
+    audit_parser.add_argument("--patient-id", default=None, help="Use a loaded patient report as the audit input.")
+    audit_parser.add_argument("--payload-file", default=None, help="Path to a JSON file matching the CGMInput schema.")
+    audit_parser.add_argument("--current-glucose", type=float, default=None, help="Override the last glucose value before auditing.")
+    audit_parser.add_argument("--gemini", action="store_true", help="Send the audit bundle to Gemini for a secondary review.")
+    audit_parser.add_argument("--model", default=None, help="Override GEMINI_MODEL for this run.")
+    audit_parser.add_argument("--timeout-seconds", type=float, default=30.0)
+
     return parser
 
 
@@ -203,6 +222,24 @@ def main() -> None:
                     min_clients=args.min_clients,
                 ),
                 indent=2,
+            )
+        )
+        return
+
+    if args.command == "audit-prediction":
+        print(
+            json.dumps(
+                run_prediction_audit(
+                    service,
+                    patient_id=args.patient_id,
+                    payload_file=args.payload_file,
+                    current_glucose=args.current_glucose,
+                    use_gemini=args.gemini,
+                    model=args.model,
+                    timeout_seconds=args.timeout_seconds,
+                ),
+                indent=2,
+                default=_json_default,
             )
         )
         return

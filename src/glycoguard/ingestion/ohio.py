@@ -38,9 +38,9 @@ def discover_ohio_split_dirs(root_dir: str | Path) -> OhioSplitPaths:
 
 
 def _to_timestamp(attrs: dict[str, str]) -> pd.Timestamp | None:
-    for key in ("ts", "timestamp", "time", "date", "start_time", "start"):
+    for key in ("ts", "timestamp", "time", "date", "start_time", "start", "ts_begin", "tbegin"):
         if key in attrs:
-            ts = pd.to_datetime(attrs[key], errors="coerce")
+            ts = pd.to_datetime(attrs[key], errors="coerce", dayfirst=True)
             if not pd.isna(ts):
                 return pd.Timestamp(ts)
     return None
@@ -70,6 +70,15 @@ def _append_interval_samples(
         rows.append({"timestamp": ts, key: value})
 
 
+def _to_end_timestamp(attrs: dict[str, str]) -> pd.Timestamp | None:
+    for key in ("end", "end_time", "ts_end", "tend"):
+        if key in attrs:
+            ts = pd.to_datetime(attrs[key], errors="coerce", dayfirst=True)
+            if not pd.isna(ts):
+                return pd.Timestamp(ts)
+    return None
+
+
 def parse_ohio_xml(path: str | Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     root = ET.parse(path).getroot()
     cgm_rows: list[dict[str, object]] = []
@@ -77,56 +86,144 @@ def parse_ohio_xml(path: str | Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.Dat
     activity_rows: list[dict[str, object]] = []
     insulin_rows: list[dict[str, object]] = []
 
-    for elem in root.iter():
-        tag = _local_name(elem.tag)
-        attrs = {_local_name(key): value for key, value in elem.attrib.items()}
-        timestamp = _to_timestamp(attrs)
-        if timestamp is None:
+    for section in root:
+        section_tag = _local_name(section.tag)
+        section_attrs = {_local_name(key): value for key, value in section.attrib.items()}
+        if len(section) == 0:
+            timestamp = _to_timestamp(section_attrs)
+            if section_tag == "glucose_level":
+                glucose_value = _to_float(section_attrs, ("value", "glucose", "cgm", "mgdl"))
+                if timestamp is not None and glucose_value is not None:
+                    cgm_rows.append({"timestamp": timestamp, "glucose": glucose_value})
+                continue
+            if section_tag == "meal":
+                carb_value = _to_float(section_attrs, ("carbs", "carb", "carbohydrates", "grams", "value"))
+                if timestamp is not None and carb_value is not None:
+                    meal_rows.append({"timestamp": timestamp, "carb_grams": carb_value})
+                continue
+            if section_tag == "bolus":
+                bolus_value = _to_float(section_attrs, ("dose", "amount", "value", "units", "bolus"))
+                if timestamp is not None and bolus_value is not None:
+                    insulin_rows.append({"timestamp": timestamp, "insulin_units": bolus_value})
+                continue
+            if section_tag in {"basal", "temp_basal"}:
+                basal_rate = _to_float(section_attrs, ("rate", "value", "basal"))
+                if timestamp is not None and basal_rate is not None:
+                    insulin_rows.append({"timestamp": timestamp, "basal_rate": basal_rate})
+                continue
+            if section_tag in {"exercise", "work"}:
+                if timestamp is None:
+                    continue
+                intensity = _to_float(section_attrs, ("intensity", "value", "level"))
+                duration = _to_float(section_attrs, ("duration", "minutes", "mins", "duration_minutes"))
+                value = 0.5 if intensity is None else max(0.1, intensity / 10.0 if intensity > 1.0 else intensity)
+                if duration and duration > 5:
+                    end = timestamp + pd.Timedelta(minutes=float(duration))
+                    _append_interval_samples(activity_rows, timestamp, end, "activity", float(value))
+                else:
+                    end = _to_end_timestamp(section_attrs)
+                    if end is not None and end > timestamp:
+                        _append_interval_samples(activity_rows, timestamp, end, "activity", float(value))
+                    else:
+                        activity_rows.append({"timestamp": timestamp, "activity": float(value)})
+                continue
+            if section_tag in {"sleep", "basis_sleep"}:
+                if timestamp is None:
+                    continue
+                end = _to_end_timestamp(section_attrs)
+                if end is not None and end > timestamp:
+                    _append_interval_samples(activity_rows, timestamp, end, "sleep_flag", 1.0)
+                else:
+                    activity_rows.append({"timestamp": timestamp, "sleep_flag": 1.0})
+                continue
+            if section_tag in {"stress", "stressors"} and timestamp is not None:
+                activity_rows.append({"timestamp": timestamp, "stress_score": _to_float(section_attrs, ("value",)) or 0.7})
+                continue
+
+        if section_tag == "glucose_level":
+            for event in section.findall(".//event"):
+                attrs = {_local_name(key): value for key, value in event.attrib.items()}
+                timestamp = _to_timestamp(attrs)
+                glucose_value = _to_float(attrs, ("value", "glucose", "cgm", "mgdl"))
+                if timestamp is not None and glucose_value is not None:
+                    cgm_rows.append({"timestamp": timestamp, "glucose": glucose_value})
             continue
 
-        glucose_value = _to_float(attrs, ("value", "glucose", "cgm", "mgdl"))
-        carb_value = _to_float(attrs, ("carbs", "carb", "carbohydrates", "grams", "value"))
-        bolus_value = _to_float(attrs, ("dose", "amount", "value", "units", "bolus"))
-        basal_rate = _to_float(attrs, ("rate", "value", "basal"))
-        intensity = _to_float(attrs, ("intensity", "value", "level"))
-        duration = _to_float(attrs, ("duration", "minutes", "mins", "duration_minutes"))
-
-        if "glucose" in tag and glucose_value is not None:
-            cgm_rows.append({"timestamp": timestamp, "glucose": glucose_value})
+        if section_tag == "meal":
+            for event in section.findall(".//event"):
+                attrs = {_local_name(key): value for key, value in event.attrib.items()}
+                timestamp = _to_timestamp(attrs)
+                carb_value = _to_float(attrs, ("carbs", "carb", "carbohydrates", "grams", "value"))
+                if timestamp is not None and carb_value is not None:
+                    meal_rows.append({"timestamp": timestamp, "carb_grams": carb_value})
             continue
 
-        if ("meal" in tag or "carb" in tag) and carb_value is not None:
-            meal_rows.append({"timestamp": timestamp, "carb_grams": carb_value})
+        if section_tag == "bolus":
+            for event in section.findall(".//event"):
+                attrs = {_local_name(key): value for key, value in event.attrib.items()}
+                timestamp = _to_timestamp(attrs)
+                bolus_value = _to_float(attrs, ("dose", "amount", "value", "units", "bolus"))
+                if timestamp is not None and bolus_value is not None:
+                    insulin_rows.append({"timestamp": timestamp, "insulin_units": bolus_value})
             continue
 
-        if "bolus" in tag and bolus_value is not None:
-            insulin_rows.append({"timestamp": timestamp, "insulin_units": bolus_value})
+        if section_tag in {"basal", "temp_basal"}:
+            for event in section.findall(".//event"):
+                attrs = {_local_name(key): value for key, value in event.attrib.items()}
+                timestamp = _to_timestamp(attrs)
+                basal_rate = _to_float(attrs, ("rate", "value", "basal"))
+                if timestamp is not None and basal_rate is not None:
+                    insulin_rows.append({"timestamp": timestamp, "basal_rate": basal_rate})
             continue
 
-        if "basal" in tag and basal_rate is not None:
-            insulin_rows.append({"timestamp": timestamp, "basal_rate": basal_rate})
+        if section_tag in {"exercise", "work"}:
+            for event in section.findall(".//event"):
+                attrs = {_local_name(key): value for key, value in event.attrib.items()}
+                timestamp = _to_timestamp(attrs)
+                if timestamp is None:
+                    continue
+                intensity = _to_float(attrs, ("intensity", "value", "level"))
+                duration = _to_float(attrs, ("duration", "minutes", "mins", "duration_minutes"))
+                value = 0.5 if intensity is None else max(0.1, intensity / 10.0 if intensity > 1.0 else intensity)
+                if duration and duration > 5:
+                    end = timestamp + pd.Timedelta(minutes=float(duration))
+                    _append_interval_samples(activity_rows, timestamp, end, "activity", float(value))
+                else:
+                    end = _to_end_timestamp(attrs)
+                    if end is not None and end > timestamp:
+                        _append_interval_samples(activity_rows, timestamp, end, "activity", float(value))
+                    else:
+                        activity_rows.append({"timestamp": timestamp, "activity": float(value)})
             continue
 
-        if any(keyword in tag for keyword in ("exercise", "activity", "work")):
-            value = 0.5 if intensity is None else max(0.1, intensity)
-            if duration and duration > 5:
-                end = timestamp + pd.Timedelta(minutes=float(duration))
-                _append_interval_samples(activity_rows, timestamp, end, "activity", float(value))
-            else:
-                activity_rows.append({"timestamp": timestamp, "activity": float(value)})
+        if section_tag == "basis_steps":
+            for event in section.findall(".//event"):
+                attrs = {_local_name(key): value for key, value in event.attrib.items()}
+                timestamp = _to_timestamp(attrs)
+                steps = _to_float(attrs, ("value",))
+                if timestamp is not None and steps is not None:
+                    activity_rows.append({"timestamp": timestamp, "activity": min(float(steps) / 150.0, 1.0)})
             continue
 
-        if "sleep" in tag:
-            end_time = pd.to_datetime(attrs.get("end") or attrs.get("end_time"), errors="coerce")
-            if pd.notna(end_time):
-                _append_interval_samples(activity_rows, timestamp, pd.Timestamp(end_time), "sleep_flag", 1.0)
-            else:
-                activity_rows.append({"timestamp": timestamp, "sleep_flag": 1.0})
+        if section_tag == "basis_sleep":
+            for event in section.findall(".//event"):
+                attrs = {_local_name(key): value for key, value in event.attrib.items()}
+                start = _to_timestamp(attrs)
+                end = _to_end_timestamp(attrs)
+                if start is None:
+                    continue
+                if end is not None and end > start:
+                    _append_interval_samples(activity_rows, start, end, "sleep_flag", 1.0)
+                else:
+                    activity_rows.append({"timestamp": start, "sleep_flag": 1.0})
             continue
 
-        if "stress" in tag:
-            stress_value = 0.6 if intensity is None else max(0.1, intensity)
-            activity_rows.append({"timestamp": timestamp, "stress_score": float(stress_value)})
+        if section_tag == "stressors":
+            for event in section.findall(".//event"):
+                attrs = {_local_name(key): value for key, value in event.attrib.items()}
+                timestamp = _to_timestamp(attrs)
+                if timestamp is not None:
+                    activity_rows.append({"timestamp": timestamp, "stress_score": 0.7})
 
     cgm = pd.DataFrame(cgm_rows)
     meals = pd.DataFrame(meal_rows)
@@ -185,4 +282,3 @@ def load_ohio_split(
     if not payload:
         raise ValueError(f"No OhioT1DM XML files found in {target_dir}")
     return payload
-

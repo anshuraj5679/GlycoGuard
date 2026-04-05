@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import uuid
 from dataclasses import dataclass
 from functools import lru_cache
@@ -19,8 +20,9 @@ from glycoguard.federated.client import run_local_simulation
 from glycoguard.ingestion.bundles import discover_bundle_paths, load_patient_bundle
 from glycoguard.ingestion.loader import align_context, prepare_cgm_frame
 from glycoguard.ingestion.ohio import load_ohio_split
-from glycoguard.models.tft_model import ForecastResult, train_tft
+from glycoguard.models.tft_model import DartsTFTForecaster, ForecastResult, train_tft
 from glycoguard.models.xgboost_model import TabularModelBundle, train_xgboost
+from glycoguard.risk import classify_risk
 from glycoguard.reporting import build_agp_payload, build_alert_log, build_waterfall_payload
 from glycoguard.schemas import CGMInput
 from glycoguard.validation import OODDetector, fit_ood_detector
@@ -78,6 +80,21 @@ class GlycoGuardService:
         self.calibration_bundle: CalibrationBundle | None = None
         self.ood_detector: OODDetector | None = None
         self._initialize_models()
+        self._bootstrap_real_data_from_env()
+
+    @staticmethod
+    def _clip_float(value: object, lower: float, upper: float) -> float:
+        return float(np.clip(float(value), lower, upper))
+
+    def _validated_context_from_row(self, row: pd.Series) -> dict[str, float | int]:
+        return {
+            "carbs_last_hour": self._clip_float(row.get("carbs_1h", 0.0), 0.0, 150.0),
+            "carbs_last_2h": self._clip_float(row.get("carbs_2h", 0.0), 0.0, 250.0),
+            "insulin_on_board": self._clip_float(row.get("insulin_on_board", 0.0), 0.0, 25.0),
+            "activity_level": self._clip_float(row.get("activity", 0.0), 0.0, 1.0),
+            "sleep_flag": int(bool(row.get("sleep_flag", 0))),
+            "stress_score": self._clip_float(row.get("stress_score", 0.0), 0.0, 1.0),
+        }
 
     def _store_patient(self, patient_id: str, frame: pd.DataFrame) -> None:
         features = compute_rolling_features(
@@ -145,7 +162,8 @@ class GlycoGuardService:
         if self._artifacts_available():
             try:
                 self.load_artifacts()
-                self._refresh_alert_logs()
+                if any(not record.alert_log for record in self.records.values()):
+                    self._refresh_alert_logs()
                 return
             except Exception:
                 self.model_bundle = None
@@ -154,23 +172,63 @@ class GlycoGuardService:
                 self.calibration_bundle = None
                 self.ood_detector = None
 
+    def _bootstrap_real_data_from_env(self) -> None:
+        if self.is_ready() and self.records:
+            return
+        ohio_root = os.getenv("GLYCOGUARD_BOOTSTRAP_OHIO_DIR", "").strip()
+        if not ohio_root:
+            return
+        root = Path(ohio_root)
+        if not root.exists():
+            return
+        try:
+            needs_training = not self._artifacts_available()
+            self.ingest_ohio(
+                root_dir=root,
+                split="train",
+                prefix="bootstrap",
+                retrain=needs_training,
+                persist=needs_training,
+            )
+        except Exception:
+            self.model_bundle = None
+            self.forecaster = None
+            self.explainer = None
+            self.calibration_bundle = None
+            self.ood_detector = None
+
     def _refresh_alert_logs(self) -> None:
         if not self.is_ready():
             return
         for record in self.records.values():
-            raw_scores, _, _, valid_features = self._raw_ensemble_probabilities(
-                record.frame,
-                record.features,
-                max_points=96,
-            )
-            probabilities = self.calibration_bundle.calibrator.transform(raw_scores)
-            record.alert_log = build_alert_log(valid_features, probabilities)
+            self._refresh_alert_log(record.patient_id)
+
+    def _refresh_alert_log(self, patient_id: str, max_points: int = 96) -> None:
+        if not self.is_ready() or patient_id not in self.records:
+            return
+        record = self.records[patient_id]
+        raw_scores, _, _, valid_features = self._raw_ensemble_probabilities(
+            record.frame,
+            record.features,
+            max_points=max_points,
+        )
+        probabilities = self.calibration_bundle.calibrator.transform(raw_scores)
+        record.alert_log = build_alert_log(valid_features, probabilities)
+
+    def _warm_loaded_forecaster(self) -> None:
+        if not self.records or self.forecaster is None:
+            return
+        record = next(iter(self.records.values()))
+        if len(record.frame) < self.config.data.window_size:
+            return
+        position = self.config.data.window_size - 1
+        self._forecast_for_position(record.frame, position)
 
     def _artifacts_available(self) -> bool:
-        return all(
-            (self.artifact_dir / name).exists()
-            for name in ("model.pkl", "forecaster.pkl", "calibrator.pkl", "ood.pkl", "metadata.json")
-        )
+        core_files = ("model.pkl", "calibrator.pkl", "ood.pkl", "metadata.json")
+        if not all((self.artifact_dir / name).exists() for name in core_files):
+            return False
+        return (self.artifact_dir / "forecaster.pkl").exists() or (self.artifact_dir / "forecaster").is_dir()
 
     def is_ready(self) -> bool:
         return (
@@ -244,8 +302,9 @@ class GlycoGuardService:
         return pd.Timestamp(record.frame.index[int(nearest)])
 
     def _rebuild_patient(self, patient_id: str, frame: pd.DataFrame) -> None:
+        existing_alert_log = self.records[patient_id].alert_log if patient_id in self.records else []
         self._store_patient(patient_id, frame.sort_index())
-        self._refresh_alert_logs()
+        self.records[patient_id].alert_log = existing_alert_log
 
     def log_meal(
         self,
@@ -339,6 +398,91 @@ class GlycoGuardService:
             self.config.model.classifier_weight * float(classifier_probability)
             + self.config.model.forecast_weight * float(forecast_probability)
         )
+
+    @staticmethod
+    def _forecast_warning_text(predicted_glucose_30min: float | None, roc_15: float) -> str:
+        if predicted_glucose_30min is None:
+            return ""
+        if predicted_glucose_30min < 70.0:
+            return "Predicted to cross 70 mg/dL threshold"
+        if predicted_glucose_30min < 80.0:
+            return "Approaching danger zone quickly" if roc_15 <= -2.0 else "Approaching danger zone"
+        return ""
+
+    @staticmethod
+    def _watch_status_text(risk_level: str | None, watch_buzz: bool, status: str = "ok") -> str:
+        if status != "ok" or risk_level is None:
+            return "Prediction unavailable"
+        if watch_buzz:
+            return "Watch buzz triggered - eat 15g carbs now"
+        if risk_level == "MEDIUM":
+            return "Watch notified - monitor closely"
+        return "No alert - glucose trajectory stable"
+
+    @staticmethod
+    def _feature_values(prediction: dict[str, object]) -> dict[str, float]:
+        waterfall = prediction.get("waterfall") or {}
+        feature_values = waterfall.get("feature_values") if isinstance(waterfall, dict) else None
+        if isinstance(feature_values, dict):
+            return {str(key): float(value) for key, value in feature_values.items()}
+        feature_frame = prediction.get("feature_frame")
+        if isinstance(feature_frame, pd.DataFrame) and not feature_frame.empty:
+            row = feature_frame.iloc[0]
+            return {str(key): float(value) for key, value in row.items()}
+        return {}
+
+    def _reason_from_signals(self, prediction: dict[str, object]) -> str:
+        if prediction.get("status") != "ok":
+            return str(prediction.get("abstention_reason") or "Prediction unavailable")
+        forecast = prediction.get("predicted_glucose_30min")
+        roc_15 = float(prediction.get("roc_15") or 0.0)
+        if forecast is not None and float(forecast) < 70.0:
+            if roc_15 < 0:
+                return f"Glucose dropping {abs(roc_15):.1f} mg/dL per 15 min"
+            return "Predicted to cross 70 mg/dL threshold"
+        if forecast is not None and float(forecast) < 80.0:
+            if roc_15 < 0:
+                return f"Glucose dropping {abs(roc_15):.1f} mg/dL per 15 min"
+            return "Approaching danger zone"
+        if roc_15 <= -1.0:
+            return f"Glucose dropping {abs(roc_15):.1f} mg/dL per 15 min"
+        return "Glucose trajectory stable"
+
+    def _top_reason(self, prediction: dict[str, object]) -> str:
+        if prediction.get("status") != "ok":
+            return str(prediction.get("abstention_reason") or "Prediction unavailable")
+        top_factors = prediction.get("top_factors") or []
+        if not top_factors:
+            return self._reason_from_signals(prediction)
+
+        feature_values = self._feature_values(prediction)
+        top = top_factors[0]
+        feature = str(top.get("feature", ""))
+        feature_value = float(feature_values.get(feature, 0.0))
+
+        if feature == "roc_15":
+            return f"Glucose dropping {abs(feature_value):.1f} mg/dL per 15 min"
+        if feature == "roc_30":
+            return f"Glucose dropped {abs(feature_value):.1f} mg/dL in last 30 min"
+        if feature == "insulin_on_board":
+            return f"Active insulin still working (~{max(feature_value, 0.0) * 45:.0f} min remaining)"
+        if feature == "carbs_1h":
+            return "No carb intake detected in last hour" if feature_value <= 0.0 else "Low carb intake in last hour"
+        if feature in {"is_night", "sleep_flag"} and feature_value >= 1.0:
+            return "Nocturnal period - reduced counter-regulatory response"
+        if feature in {"activity", "activity_6h"}:
+            return "Post-exercise window - enhanced insulin sensitivity"
+        if feature in {"lbgi", "lbgi_2h"}:
+            return "Historically hypo-prone glucose pattern"
+        if feature == "mean_2h":
+            return "2-hour glucose average trending low"
+        if feature == "min_2h":
+            return "Recent glucose dipped dangerously low"
+
+        message = str(top.get("message") or "")
+        if message:
+            return message.replace("Increases risk: ", "").replace("Reduces risk: ", "")
+        return self._reason_from_signals(prediction)
 
     def _forecast_for_position(self, frame: pd.DataFrame, position: int) -> ForecastResult:
         history = frame.iloc[position - self.config.data.window_size + 1 : position + 1]
@@ -457,9 +601,13 @@ class GlycoGuardService:
         target_dir = Path(directory) if directory is not None else self.artifact_dir
         target_dir.mkdir(parents=True, exist_ok=True)
         save_pickle(target_dir / "model.pkl", self.model_bundle)
-        save_pickle(target_dir / "forecaster.pkl", self.forecaster)
+        if getattr(self.forecaster, "backend", None) == "darts_tft" and isinstance(self.forecaster, DartsTFTForecaster):
+            self.forecaster.save(target_dir / "forecaster")
+        else:
+            save_pickle(target_dir / "forecaster.pkl", self.forecaster)
         save_pickle(target_dir / "calibrator.pkl", self.calibration_bundle)
         save_pickle(target_dir / "ood.pkl", self.ood_detector)
+        save_pickle(target_dir / "records.pkl", self.records)
         save_json(
             target_dir / "metadata.json",
             {
@@ -478,9 +626,16 @@ class GlycoGuardService:
     def load_artifacts(self, directory: str | Path | None = None) -> dict[str, object]:
         target_dir = Path(directory) if directory is not None else self.artifact_dir
         self.model_bundle = load_pickle(target_dir / "model.pkl")
-        self.forecaster = load_pickle(target_dir / "forecaster.pkl")
+        forecaster_dir = target_dir / "forecaster"
+        if forecaster_dir.is_dir():
+            self.forecaster = DartsTFTForecaster.load(forecaster_dir)
+        else:
+            self.forecaster = load_pickle(target_dir / "forecaster.pkl")
         self.calibration_bundle = load_pickle(target_dir / "calibrator.pkl")
         self.ood_detector = load_pickle(target_dir / "ood.pkl")
+        records_path = target_dir / "records.pkl"
+        if records_path.exists():
+            self.records = load_pickle(records_path)
         metadata = load_json(target_dir / "metadata.json")
         self.default_patient_id = metadata.get("default_patient_id")
         for patient_id, payload in metadata.get("profiles", {}).items():
@@ -496,6 +651,8 @@ class GlycoGuardService:
             )
         if self.records:
             self.explainer = HypoExplainer(self.model_bundle, self._background_frame())
+            if self._artifacts_need_retrain():
+                self._warm_loaded_forecaster()
         return metadata
 
     def _sample_forecasts(
@@ -567,93 +724,104 @@ class GlycoGuardService:
         original_explainer = self.explainer
         original_calibration_bundle = self.calibration_bundle
         original_ood_detector = self.ood_detector
-        for patient_id, frame in train_frames.items():
-            self._store_patient(f"ohio-{patient_id}-train", frame)
-        training_ids = [patient_id for patient_id in self.records if patient_id.startswith("ohio-") and patient_id.endswith("-train")]
-        train_summary = self.retrain(patient_ids=training_ids, persist=persist)
+        original_latest_benchmark = self.latest_benchmark
+        benchmark: dict[str, object] | None = None
 
-        per_patient: list[dict[str, object]] = []
-        all_truth: list[int] = []
-        all_probabilities: list[float] = []
-        forecast_preds: list[float] = []
-        forecast_actuals: list[float] = []
-        combined_leads: list[float] = []
-        total_events = 0
-        covered_events = 0
+        try:
+            for patient_id, frame in train_frames.items():
+                self._store_patient(f"ohio-{patient_id}-train", frame)
+            training_ids = [patient_id for patient_id in self.records if patient_id.startswith("ohio-") and patient_id.endswith("-train")]
+            train_summary = self.retrain(patient_ids=training_ids, persist=persist)
 
-        for patient_id, frame in test_frames.items():
-            features = compute_rolling_features(
-                frame,
-                window_steps=self.config.data.window_size,
-                horizon_steps=self.config.data.horizon_steps,
-                hypo_threshold=self.config.data.hypo_threshold,
-                severe_threshold=self.config.data.severe_threshold,
-            )
-            raw_scores, _, _, valid_features = self._raw_ensemble_probabilities(
-                frame,
-                features,
-                max_points=max(25, max_forecast_points // max(1, len(test_frames))),
-            )
-            probabilities = self.calibration_bundle.calibrator.transform(raw_scores)
-            metrics = compute_binary_metrics(valid_features["hypo_label"], probabilities)
-            lead_time = compute_lead_time(
-                frame.loc[valid_features.index, "glucose"],
-                probabilities,
-                threshold=self.config.model.medium_risk_threshold,
-            )
-            pred_glucose, actual_glucose = self._sample_forecasts(frame, features.index, max_points=max(25, max_forecast_points // max(1, len(test_frames))))
-            clarke = compute_clarke_grid(actual_glucose, pred_glucose) if actual_glucose else {"counts": {}, "percentages": {}, "zone_ab": 0.0}
-            per_patient.append(
-                {
-                    "patient_id": patient_id,
-                    "num_samples": int(len(valid_features)),
-                    "binary_metrics": metrics,
-                    "lead_time": lead_time,
-                    "clarke_grid": clarke,
-                }
-            )
-            all_truth.extend(valid_features["hypo_label"].astype(int).tolist())
-            all_probabilities.extend([float(value) for value in probabilities])
-            forecast_preds.extend(pred_glucose)
-            forecast_actuals.extend(actual_glucose)
-            combined_leads.extend(lead_time["lead_times"])
-            total_events += int(lead_time["num_events"])
-            covered_events += int(lead_time["num_events_covered"])
+            per_patient: list[dict[str, object]] = []
+            all_truth: list[int] = []
+            all_probabilities: list[float] = []
+            forecast_preds: list[float] = []
+            forecast_actuals: list[float] = []
+            combined_leads: list[float] = []
+            total_events = 0
+            covered_events = 0
 
-        overall_metrics = compute_binary_metrics(all_truth, all_probabilities) if all_truth else {}
-        lead_time = {
-            "num_events": total_events,
-            "num_events_covered": covered_events,
-            "coverage": float(covered_events / total_events) if total_events else 0.0,
-            "mean_minutes": float(np.mean(combined_leads)) if combined_leads else 0.0,
-            "median_minutes": float(np.median(combined_leads)) if combined_leads else 0.0,
-            "max_minutes": float(np.max(combined_leads)) if combined_leads else 0.0,
-            "lead_times": [float(value) for value in combined_leads],
-        }
-        clarke = compute_clarke_grid(forecast_actuals, forecast_preds) if forecast_actuals else {"counts": {}, "percentages": {}, "zone_ab": 0.0}
+            for patient_id, frame in test_frames.items():
+                features = compute_rolling_features(
+                    frame,
+                    window_steps=self.config.data.window_size,
+                    horizon_steps=self.config.data.horizon_steps,
+                    hypo_threshold=self.config.data.hypo_threshold,
+                    severe_threshold=self.config.data.severe_threshold,
+                )
+                raw_scores, _, _, valid_features = self._raw_ensemble_probabilities(
+                    frame,
+                    features,
+                    max_points=max(25, max_forecast_points // max(1, len(test_frames))),
+                )
+                probabilities = self.calibration_bundle.calibrator.transform(raw_scores)
+                metrics = compute_binary_metrics(valid_features["hypo_label"], probabilities)
+                lead_time = compute_lead_time(
+                    frame.loc[valid_features.index, "glucose"],
+                    probabilities,
+                    threshold=self.config.model.medium_risk_threshold,
+                )
+                pred_glucose, actual_glucose = self._sample_forecasts(
+                    frame,
+                    features.index,
+                    max_points=max(25, max_forecast_points // max(1, len(test_frames))),
+                )
+                clarke = compute_clarke_grid(actual_glucose, pred_glucose) if actual_glucose else {"counts": {}, "percentages": {}, "zone_ab": 0.0}
+                per_patient.append(
+                    {
+                        "patient_id": patient_id,
+                        "num_samples": int(len(valid_features)),
+                        "binary_metrics": metrics,
+                        "lead_time": lead_time,
+                        "clarke_grid": clarke,
+                    }
+                )
+                all_truth.extend(valid_features["hypo_label"].astype(int).tolist())
+                all_probabilities.extend([float(value) for value in probabilities])
+                forecast_preds.extend(pred_glucose)
+                forecast_actuals.extend(actual_glucose)
+                combined_leads.extend(lead_time["lead_times"])
+                total_events += int(lead_time["num_events"])
+                covered_events += int(lead_time["num_events_covered"])
 
-        benchmark = {
-            "dataset": "OhioT1DM",
-            "root_dir": str(root_dir),
-            "train_patients": sorted(train_frames.keys()),
-            "test_patients": sorted(test_frames.keys()),
-            "train_summary": train_summary,
-            "overall_metrics": overall_metrics,
-            "lead_time": lead_time,
-            "clarke_grid": clarke,
-            "per_patient": per_patient,
-            "max_forecast_points": int(max_forecast_points),
-        }
-        self.latest_benchmark = benchmark
-        self.records = original_records
-        self.profiles = original_profiles
-        self.default_patient_id = original_default_patient_id
-        self.model_bundle = original_model_bundle
-        self.forecaster = original_forecaster
-        self.explainer = original_explainer
-        self.calibration_bundle = original_calibration_bundle
-        self.ood_detector = original_ood_detector
-        return benchmark
+            overall_metrics = compute_binary_metrics(all_truth, all_probabilities) if all_truth else {}
+            lead_time = {
+                "num_events": total_events,
+                "num_events_covered": covered_events,
+                "coverage": float(covered_events / total_events) if total_events else 0.0,
+                "mean_minutes": float(np.mean(combined_leads)) if combined_leads else 0.0,
+                "median_minutes": float(np.median(combined_leads)) if combined_leads else 0.0,
+                "max_minutes": float(np.max(combined_leads)) if combined_leads else 0.0,
+                "lead_times": [float(value) for value in combined_leads],
+            }
+            clarke = compute_clarke_grid(forecast_actuals, forecast_preds) if forecast_actuals else {"counts": {}, "percentages": {}, "zone_ab": 0.0}
+
+            benchmark = {
+                "dataset": "OhioT1DM",
+                "root_dir": str(root_dir),
+                "train_patients": sorted(train_frames.keys()),
+                "test_patients": sorted(test_frames.keys()),
+                "train_summary": train_summary,
+                "overall_metrics": overall_metrics,
+                "lead_time": lead_time,
+                "clarke_grid": clarke,
+                "per_patient": per_patient,
+                "max_forecast_points": int(max_forecast_points),
+            }
+            self.latest_benchmark = benchmark
+            return benchmark
+        finally:
+            self.records = original_records
+            self.profiles = original_profiles
+            self.default_patient_id = original_default_patient_id
+            self.model_bundle = original_model_bundle
+            self.forecaster = original_forecaster
+            self.explainer = original_explainer
+            self.calibration_bundle = original_calibration_bundle
+            self.ood_detector = original_ood_detector
+            if benchmark is None:
+                self.latest_benchmark = original_latest_benchmark
 
     def run_federated_demo(
         self,
@@ -689,15 +857,24 @@ class GlycoGuardService:
         return {
             "patient_id": patient_id,
             "status": "insufficient_confidence",
+            "current_glucose": None,
+            "roc_15": None,
             "hypo_probability": None,
             "classifier_probability": None,
             "forecast_probability": None,
             "risk_level": None,
+            "prob_risk": None,
+            "forecast_risk": None,
             "predicted_glucose_30min": None,
             "forecast_trace": [],
             "forecast_lower": [],
             "forecast_upper": [],
+            "forecast_notice": None,
             "alert_required": False,
+            "watch_buzz": False,
+            "forecast_warning": "",
+            "top_reason": reason,
+            "watch_status": "Prediction unavailable",
             "model_backend": model_backend or (self.model_bundle.backend if self.model_bundle is not None else "unavailable"),
             "forecast_backend": forecast_backend or (getattr(self.forecaster, "backend", "unavailable") if self.forecaster is not None else "unavailable"),
             "confidence": None if confidence is None else round(float(confidence), 4),
@@ -728,37 +905,87 @@ class GlycoGuardService:
             )
 
         classifier_probability = float(self.model_bundle.predict_proba(inference_features)[0])
-        forecast: ForecastResult = self.forecaster.predict(
-            glucose_readings=payload.glucose_readings,
-            carbs_last_hour=payload.carbs_last_hour,
-            carbs_last_2h=payload.carbs_last_hour if payload.carbs_last_2h is None else payload.carbs_last_2h,
-            insulin_on_board=payload.insulin_on_board,
-            activity_level=payload.activity_level,
-            sleep_flag=payload.sleep_flag,
-            stress_score=payload.stress_score,
-        )
+        try:
+            forecast: ForecastResult = self.forecaster.predict(
+                glucose_readings=payload.glucose_readings,
+                carbs_last_hour=payload.carbs_last_hour,
+                carbs_last_2h=payload.carbs_last_hour if payload.carbs_last_2h is None else payload.carbs_last_2h,
+                insulin_on_board=payload.insulin_on_board,
+                activity_level=payload.activity_level,
+                sleep_flag=payload.sleep_flag,
+                stress_score=payload.stress_score,
+            )
+        except Exception as exc:
+            confidence = max(0.0, 1.0 - float(distances[0]) / max(float(self.ood_detector.threshold), 1e-6))
+            return self._abstain_response(
+                patient_id=patient_id,
+                reason=f"Forecast backend failed at runtime: {type(exc).__name__}. Restart the app or retrain artifacts.",
+                model_backend=self.model_bundle.backend,
+                forecast_backend=getattr(self.forecaster, "backend", "unavailable"),
+                confidence=confidence,
+            )
         raw_probability = self._combine_probabilities(classifier_probability, forecast.risk_probability)
         hypo_probability = float(self.calibration_bundle.calibrator.transform([raw_probability])[0])
-        risk_level = (
-            "HIGH"
-            if hypo_probability >= self.config.model.high_risk_threshold
-            else "MEDIUM"
-            if hypo_probability >= self.config.model.medium_risk_threshold
-            else "LOW"
-        )
         confidence = max(0.0, 1.0 - float(distances[0]) / max(float(self.ood_detector.threshold), 1e-6))
+        current_glucose = float(payload.glucose_readings[-1])
+        roc_15 = float(payload.glucose_readings[-1] - payload.glucose_readings[-4]) if len(payload.glucose_readings) >= 4 else 0.0
+        forecast_trace = [round(float(value), 1) for value in forecast.forecast]
+        forecast_lower = [round(float(value), 1) for value in forecast.lower]
+        forecast_upper = [round(float(value), 1) for value in forecast.upper]
+        raw_predicted_glucose_30min = float(forecast.forecast[-1])
+        risk_summary = classify_risk(
+            prob=hypo_probability,
+            predicted_glucose_30min=raw_predicted_glucose_30min,
+            current_glucose=current_glucose,
+            roc_15=roc_15,
+            high_threshold=self.config.model.high_risk_threshold,
+            medium_threshold=self.config.model.medium_risk_threshold,
+            severe_threshold=float(self.config.data.severe_threshold),
+        )
+        risk_level = str(risk_summary["risk_level"])
+        predicted_glucose_30min = round(raw_predicted_glucose_30min, 1)
+        forecast_notice = None
+        if current_glucose <= float(self.config.data.severe_threshold):
+            predicted_glucose_30min = None
+            forecast_trace = []
+            forecast_lower = []
+            forecast_upper = []
+            forecast_notice = (
+                f"Current glucose is already below {self.config.data.severe_threshold:.0f} mg/dL. "
+                "The 30-minute forecast is hidden because this is already an active low-glucose event."
+            )
+        forecast_warning = self._forecast_warning_text(predicted_glucose_30min, roc_15)
+        watch_buzz = bool(risk_summary["watch_buzz"])
+        watch_status = self._watch_status_text(risk_level, watch_buzz)
+        top_reason = self._reason_from_signals(
+            {
+                "status": "ok",
+                "roc_15": roc_15,
+                "predicted_glucose_30min": predicted_glucose_30min,
+                "risk_level": risk_level,
+            }
+        )
         return {
             "patient_id": patient_id,
             "status": "ok",
+            "current_glucose": round(current_glucose, 1),
+            "roc_15": round(roc_15, 1),
             "hypo_probability": round(float(hypo_probability), 4),
             "classifier_probability": round(classifier_probability, 4),
             "forecast_probability": round(float(forecast.risk_probability), 4),
             "risk_level": risk_level,
-            "predicted_glucose_30min": round(float(forecast.forecast[-1]), 1),
-            "forecast_trace": [round(float(value), 1) for value in forecast.forecast],
-            "forecast_lower": [round(float(value), 1) for value in forecast.lower],
-            "forecast_upper": [round(float(value), 1) for value in forecast.upper],
-            "alert_required": risk_level == "HIGH",
+            "prob_risk": str(risk_summary["prob_risk"]),
+            "forecast_risk": str(risk_summary["forecast_risk"]),
+            "predicted_glucose_30min": predicted_glucose_30min,
+            "forecast_trace": forecast_trace,
+            "forecast_lower": forecast_lower,
+            "forecast_upper": forecast_upper,
+            "forecast_notice": forecast_notice,
+            "alert_required": bool(risk_summary["alert_required"]),
+            "watch_buzz": watch_buzz,
+            "forecast_warning": forecast_warning,
+            "top_reason": top_reason,
+            "watch_status": watch_status,
             "model_backend": self.model_bundle.backend,
             "forecast_backend": forecast.backend,
             "confidence": round(confidence, 4),
@@ -780,6 +1007,12 @@ class GlycoGuardService:
             return prediction
         explanation = self.explainer.explain(prediction["feature_frame"])
         prediction.update(explanation)
+        prediction["top_reason"] = self._top_reason(prediction)
+        prediction["watch_status"] = self._watch_status_text(
+            prediction.get("risk_level"),
+            bool(prediction.get("watch_buzz")),
+            status=str(prediction.get("status", "ok")),
+        )
         prediction.pop("feature_frame", None)
         return prediction
 
@@ -787,18 +1020,21 @@ class GlycoGuardService:
         self.ensure_ready(require_patient=True)
         pid = patient_id or self.default_patient_id
         record = self.records[pid]
+        if not record.alert_log:
+            self._refresh_alert_log(pid, max_points=48)
         recent = record.frame.tail(24 * 12).copy()
         latest = recent.iloc[-1]
+        validated_context = self._validated_context_from_row(latest)
         roc_15 = float(recent["glucose"].diff(3).iloc[-1]) if len(recent) >= 4 else 0.0
         current_payload = CGMInput(
             patient_id=pid,
             glucose_readings=recent["glucose"].tail(24).tolist(),
-            carbs_last_hour=float(latest.get("carbs_1h", 0.0)),
-            carbs_last_2h=float(latest.get("carbs_2h", 0.0)),
-            insulin_on_board=float(latest.get("insulin_on_board", 0.0)),
-            activity_level=float(latest.get("activity", 0.0)),
-            sleep_flag=int(latest.get("sleep_flag", 0)),
-            stress_score=float(latest.get("stress_score", 0.0)),
+            carbs_last_hour=float(validated_context["carbs_last_hour"]),
+            carbs_last_2h=float(validated_context["carbs_last_2h"]),
+            insulin_on_board=float(validated_context["insulin_on_board"]),
+            activity_level=float(validated_context["activity_level"]),
+            sleep_flag=int(validated_context["sleep_flag"]),
+            stress_score=float(validated_context["stress_score"]),
             timestamp=recent.index[-1].to_pydatetime(),
         )
         prediction = self.explain(current_payload)
@@ -824,12 +1060,12 @@ class GlycoGuardService:
                 for ts, value in recent["glucose"].items()
             ],
             "context": {
-                "carbs_1h": round(float(latest.get("carbs_1h", 0.0)), 1),
-                "carbs_2h": round(float(latest.get("carbs_2h", 0.0)), 1),
-                "insulin_on_board": round(float(latest.get("insulin_on_board", 0.0)), 2),
-                "activity": round(float(latest.get("activity", 0.0)), 2),
-                "sleep_flag": int(latest.get("sleep_flag", 0)),
-                "stress_score": round(float(latest.get("stress_score", 0.0)), 2),
+                "carbs_1h": round(float(validated_context["carbs_last_hour"]), 1),
+                "carbs_2h": round(float(validated_context["carbs_last_2h"]), 1),
+                "insulin_on_board": round(float(validated_context["insulin_on_board"]), 2),
+                "activity": round(float(validated_context["activity_level"]), 2),
+                "sleep_flag": int(validated_context["sleep_flag"]),
+                "stress_score": round(float(validated_context["stress_score"]), 2),
             },
             "agp": agp,
             "metrics": self.model_bundle.metrics,
@@ -945,31 +1181,12 @@ class GlycoGuardService:
 
     @staticmethod
     def _watch_reason(prediction: dict[str, object]) -> str:
-        mapping = {
-            "roc_15": "Glucose dropping fast",
-            "roc_30": "Trend still falling",
-            "insulin_on_board": "Active insulin still working",
-            "activity": "Recent activity raising risk",
-            "activity_6h": "Post-exercise low window",
-            "sleep_flag": "Overnight low-risk window",
-            "carbs_1h": "Recent carbs are protective",
-            "time_since_last_meal_min": "Long gap since last meal",
-            "min_2h": "Recent glucose already low",
-            "lbgi_2h": "Pattern suggests low-glucose risk",
-        }
-        top_factors = prediction.get("top_factors", [])
         if prediction.get("status") != "ok":
             return str(prediction.get("abstention_reason") or "Prediction unavailable")[:48]
-        if not top_factors:
-            return "Stable glucose trend"
-        top = top_factors[0]
-        feature = str(top.get("feature", ""))
-        contribution = float(top.get("contribution", 0.0))
-        if prediction.get("risk_level") == "LOW" and contribution < 0:
-            if feature == "carbs_1h":
-                return "Recent carbs are keeping you safer"
-            return "Risk is low right now"
-        return mapping.get(feature, str(top.get("message", "Monitor trend")).replace("Increases risk: ", "")[:48])
+        reason = str(prediction.get("top_reason") or "").strip()
+        if reason:
+            return reason[:64]
+        return "Glucose trajectory stable"
 
     def build_watch_payload(
         self,
@@ -981,16 +1198,25 @@ class GlycoGuardService:
         session_id: str | None = None,
         status: str = "live",
     ) -> dict[str, object]:
+        trend_value = float(prediction.get("roc_15", roc_15))
         return {
             "patient_id": patient_id,
             "glucose": round(float(current_glucose), 1),
-            "trend": f"{float(roc_15):+.1f} mg/dL per 15min",
+            "roc_15": round(trend_value, 1),
+            "trend": f"{trend_value:+.1f} mg/dL per 15min",
             "risk": prediction["risk_level"] or "UNKNOWN",
             "reason": self._watch_reason(prediction),
-            "buzz": bool(prediction["alert_required"]),
+            "buzz": bool(prediction.get("watch_buzz", prediction["alert_required"])),
             "forecast_30min": None
             if prediction.get("predicted_glucose_30min") is None
             else round(float(prediction["predicted_glucose_30min"]), 1),
+            "forecast_warning": str(prediction.get("forecast_warning") or ""),
+            "hypo_probability": prediction.get("hypo_probability"),
+            "top_reason": str(prediction.get("top_reason") or self._watch_reason(prediction)),
+            "watch_status": str(
+                prediction.get("watch_status")
+                or self._watch_status_text(prediction.get("risk_level"), bool(prediction.get("watch_buzz", prediction["alert_required"])), status=str(prediction.get("status", "ok")))
+            ),
             "updated_at": pd.Timestamp(timestamp).isoformat(),
             "status": status,
             "session_id": session_id,
@@ -1013,16 +1239,17 @@ class GlycoGuardService:
         history = record.frame.iloc[window_start : session.cursor + 1]
         current = record.frame.iloc[session.cursor]
         timestamp = pd.Timestamp(record.frame.index[session.cursor])
+        validated_context = self._validated_context_from_row(current)
         roc_15 = float(history["glucose"].diff(3).iloc[-1]) if len(history) >= 4 else 0.0
         payload = CGMInput(
             patient_id=session.patient_id,
             glucose_readings=history["glucose"].tolist(),
-            carbs_last_hour=float(current.get("carbs_1h", 0.0)),
-            carbs_last_2h=float(current.get("carbs_2h", 0.0)),
-            insulin_on_board=float(current.get("insulin_on_board", 0.0)),
-            activity_level=float(current.get("activity", 0.0)),
-            sleep_flag=int(current.get("sleep_flag", 0)),
-            stress_score=float(current.get("stress_score", 0.0)),
+            carbs_last_hour=float(validated_context["carbs_last_hour"]),
+            carbs_last_2h=float(validated_context["carbs_last_2h"]),
+            insulin_on_board=float(validated_context["insulin_on_board"]),
+            activity_level=float(validated_context["activity_level"]),
+            sleep_flag=int(validated_context["sleep_flag"]),
+            stress_score=float(validated_context["stress_score"]),
             timestamp=timestamp.to_pydatetime(),
         )
         prediction = self.explain(payload)

@@ -5,6 +5,7 @@ from conftest import write_ohio_fixture
 from fastapi.testclient import TestClient
 
 from glycoguard.api.main import app
+from glycoguard.risk import classify_risk
 from glycoguard.service import get_service
 
 
@@ -72,6 +73,66 @@ def test_predict_requires_real_training_and_rejects_invalid_payload() -> None:
     assert invalid.status_code == 422
 
 
+def test_audit_endpoint_returns_deterministic_audit_for_payload(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    class DummyService:
+        def explain(self, payload):  # type: ignore[no-untyped-def]
+            roc_15 = float(payload.glucose_readings[-1] - payload.glucose_readings[-4])
+            risk = classify_risk(
+                prob=0.46,
+                predicted_glucose_30min=78.0,
+                current_glucose=float(payload.glucose_readings[-1]),
+                roc_15=roc_15,
+            )
+            return {
+                "patient_id": payload.patient_id or "audit-demo",
+                "status": "ok",
+                "current_glucose": round(float(payload.glucose_readings[-1]), 1),
+                "roc_15": round(roc_15, 1),
+                "hypo_probability": 0.46,
+                "risk_level": risk["risk_level"],
+                "prob_risk": risk["prob_risk"],
+                "forecast_risk": risk["forecast_risk"],
+                "predicted_glucose_30min": 78.0,
+                "alert_required": risk["alert_required"],
+                "watch_buzz": risk["watch_buzz"],
+                "top_reason": "Glucose dropping 6.0 mg/dL per 15 min",
+                "watch_status": "Watch notified - monitor closely",
+                "model_backend": "xgboost",
+                "forecast_backend": "tft",
+                "confidence": 0.91,
+                "abstention_reason": None,
+                "explanation": "",
+                "top_factors": [],
+                "shap_values": {},
+                "waterfall": None,
+            }
+
+    monkeypatch.setattr("glycoguard.api.main.get_service", lambda: DummyService())
+
+    response = client.post(
+        "/audit",
+        json={
+            "payload": {
+                "patient_id": "audit-demo",
+                "glucose_readings": [120.0] * 20 + [112.0, 106.0, 100.0, 94.0],
+                "carbs_last_hour": 0.0,
+                "carbs_last_2h": 0.0,
+                "insulin_on_board": 2.0,
+                "activity_level": 0.2,
+                "sleep_flag": 0,
+                "stress_score": 0.1,
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["payload"]["patient_id"] == "audit-demo"
+    assert body["prediction"]["risk_level"] in {"LOW", "MEDIUM", "HIGH"}
+    assert body["audit"]["is_consistent"] is True
+    assert body["gemini_review"] is None
+
+
 def test_real_ingest_report_predict_and_watch_flow(tmp_path) -> None:
     _prepare_real_service(tmp_path)
 
@@ -106,6 +167,32 @@ def test_real_ingest_report_predict_and_watch_flow(tmp_path) -> None:
     explain = client.post("/explain", json=payload)
     assert explain.status_code == 200
     assert explain.json()["status"] in {"ok", "insufficient_confidence"}
+
+    audit = client.post("/audit", json={"payload": payload})
+    assert audit.status_code == 200
+    audit_body = audit.json()
+    assert "audit" in audit_body
+    assert audit_body["payload"]["glucose_readings"][-1] == payload["glucose_readings"][-1]
+    assert audit_body["audit"]["status"] in {"ok", "insufficient_confidence"}
+    assert audit_body["gemini_review"] is None
+
+    severe_payload = {
+        "patient_id": report_body["patient_id"],
+        "glucose_readings": [126, 124, 122, 120, 118, 116, 114, 112, 110, 108, 106, 103, 100, 97, 94, 90, 86, 82, 78, 74, 70, 66, 60, 52],
+        "carbs_last_hour": 0,
+        "carbs_last_2h": 0,
+        "insulin_on_board": 5.0,
+        "activity_level": 0.65,
+        "sleep_flag": 1,
+        "stress_score": 0.25,
+    }
+    severe_predict = client.post("/predict", json=severe_payload)
+    assert severe_predict.status_code == 200
+    severe_body = severe_predict.json()
+    if severe_body["status"] == "ok":
+        assert severe_body["predicted_glucose_30min"] is None
+        assert severe_body["forecast_trace"] == []
+        assert "active low-glucose event" in severe_body["forecast_notice"]
 
     watch_payload = client.get("/watch/payload")
     assert watch_payload.status_code == 200

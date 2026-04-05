@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse
 
 from glycoguard.federated.client import federated_status
 from glycoguard.config import load_config
+from glycoguard.gemini_audit import run_prediction_audit
 from glycoguard.schemas import (
+    AuditRequest,
     ArtifactRequest,
     BundleIngestRequest,
     CGMInput,
@@ -108,6 +111,25 @@ def create_app() -> FastAPI:
         try:
             service = get_service()
             return service.explain(data)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.post("/audit")
+    def audit(payload: AuditRequest) -> dict[str, object]:
+        try:
+            service = get_service()
+            result = run_prediction_audit(
+                service,
+                patient_id=payload.patient_id,
+                payload=payload.payload,
+                current_glucose=payload.current_glucose,
+                use_gemini=payload.use_gemini,
+                model=payload.model,
+                timeout_seconds=payload.timeout_seconds,
+            )
+            return jsonable_encoder(result)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:

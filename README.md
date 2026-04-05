@@ -55,6 +55,7 @@ python -m glycoguard.cli benchmark-ohio data\raw\OhioT1DM --max-forecast-points 
 - `GET /report/{patient_id}`
 - `POST /predict`
 - `POST /explain`
+- `POST /audit`
 - `POST /log/meal`
 - `POST /log/insulin`
 - `POST /ingest`
@@ -81,7 +82,35 @@ python -m glycoguard.cli train --persist
 python -m glycoguard.cli ingest-bundle data\raw\patient_001 --retrain
 python -m glycoguard.cli benchmark-ohio data\raw\OhioT1DM --max-forecast-points 500
 python -m glycoguard.cli federated-demo --rounds 3
+python -m glycoguard.cli audit-prediction --patient-id bootstrap-559-ws-training --gemini
 ```
+
+## Gemini audit for prediction checking
+
+Use Gemini as a reviewer of the model output, not as the source of truth. GlycoGuard should first run its own deterministic audit against the computed prediction and only then ask Gemini to review whether the output is internally consistent.
+
+Add your Gemini keys in the repo-root `.env`:
+
+```powershell
+GEMINI_API_KEY_1=your-first-key
+GEMINI_API_KEY_2=your-second-key
+GEMINI_API_KEY_3=your-third-key
+GEMINI_MODEL=gemini-3.1-flash-lite
+```
+
+Then run either of these:
+
+```powershell
+python -m glycoguard.cli audit-prediction --patient-id bootstrap-559-ws-training
+python -m glycoguard.cli audit-prediction --patient-id bootstrap-559-ws-training --current-glucose 92 --gemini
+python -m glycoguard.cli audit-prediction --payload-file sample_payload.json --gemini
+```
+
+The command returns JSON with:
+- `payload`: the exact input audited
+- `prediction`: the model output from `service.explain(...)`
+- `audit`: deterministic rule check for risk consistency
+- `gemini_review`: optional Gemini review, with automatic fallback across `GEMINI_API_KEY_1..3`
 
 ## V2 demo flows
 

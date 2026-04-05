@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from conftest import write_ohio_fixture
 from glycoguard.config import load_config
@@ -14,6 +16,7 @@ from glycoguard.service import GlycoGuardService
 
 
 def _strict_config(tmp_path: Path):
+    os.environ["GLYCOGUARD_BOOTSTRAP_OHIO_DIR"] = ""
     config = load_config("configs/default.yaml")
     config.model.artifact_dir = str(tmp_path / "artifacts")
     return config
@@ -74,16 +77,15 @@ def test_bundle_ingestion_and_retrain(tmp_path: Path) -> None:
     assert service.is_ready() is True
 
 
-def test_artifact_round_trip_requires_real_records(tmp_path: Path) -> None:
+def test_artifact_round_trip_restores_real_records(tmp_path: Path) -> None:
     ohio_root = write_ohio_fixture(tmp_path, patient_ids=("540", "544", "552"), rows=360)
     config = _strict_config(tmp_path)
     service = GlycoGuardService(config=config)
     service.ingest_ohio(ohio_root, split="train", prefix="strict", retrain=True, persist=True)
 
     restored = GlycoGuardService(config=config)
-    assert restored.is_ready() is False
-    restored.ingest_ohio(ohio_root, split="train", prefix="strict", retrain=False, persist=False)
     assert restored.is_ready() is True
+    assert len(restored.records) == 3
 
 
 def test_ohio_loader_and_benchmark_flow(tmp_path: Path) -> None:
@@ -117,6 +119,82 @@ def test_federated_demo_and_waterfall_payload(tmp_path: Path) -> None:
     report = service.get_report()
     assert "waterfall" in report
     assert report["prediction"]["status"] == "ok"
+
+
+def test_logging_updates_patient_without_global_alert_refresh(tmp_path: Path) -> None:
+    ohio_root = write_ohio_fixture(tmp_path, patient_ids=("540", "544", "552"), rows=360)
+    service = GlycoGuardService(config=_strict_config(tmp_path))
+    service.ingest_ohio(ohio_root, split="train", prefix="strict", retrain=True, persist=False)
+
+    patient_id = service.default_patient_id
+    assert patient_id is not None
+    prior_alert_log = [{"timestamp": "seed", "risk_level": "LOW"}]
+    service.records[patient_id].alert_log = prior_alert_log.copy()
+
+    def fail_refresh() -> None:
+        raise AssertionError("global alert refresh should not run during meal/insulin logging")
+
+    service._refresh_alert_logs = fail_refresh  # type: ignore[method-assign]
+
+    meal_result = service.log_meal(patient_id, carb_grams=15.0)
+    insulin_result = service.log_insulin(patient_id, insulin_units=2.0, insulin_type="bolus")
+
+    assert meal_result["patient_id"] == patient_id
+    assert insulin_result["patient_id"] == patient_id
+    assert service.records[patient_id].alert_log == prior_alert_log
+
+
+def test_report_clamps_loaded_context_before_building_cgm_input(tmp_path: Path) -> None:
+    ohio_root = write_ohio_fixture(tmp_path, patient_ids=("540", "544", "552"), rows=360)
+    service = GlycoGuardService(config=_strict_config(tmp_path))
+    service.ingest_ohio(ohio_root, split="train", prefix="strict", retrain=True, persist=False)
+
+    patient_id = service.default_patient_id
+    assert patient_id is not None
+
+    for _ in range(3):
+        service.log_insulin(patient_id, insulin_units=10.0, insulin_type="bolus")
+
+    report = service.get_report()
+
+    assert report["patient_id"] == patient_id
+    assert report["context"]["insulin_on_board"] == 25.0
+    assert report["prediction"]["status"] in {"ok", "insufficient_confidence"}
+
+
+def test_predict_abstains_when_forecaster_runtime_fails(tmp_path: Path) -> None:
+    ohio_root = write_ohio_fixture(tmp_path, patient_ids=("540", "544", "552"), rows=360)
+    service = GlycoGuardService(config=_strict_config(tmp_path))
+    service.ingest_ohio(ohio_root, split="train", prefix="strict", retrain=True, persist=False)
+
+    def broken_predict(**_: object):
+        raise RuntimeError("synthetic TFT failure")
+
+    service.forecaster.predict = broken_predict  # type: ignore[method-assign]
+    report = service.get_report()
+
+    assert report["prediction"]["status"] == "insufficient_confidence"
+    assert "Forecast backend failed at runtime" in report["prediction"]["abstention_reason"]
+
+
+def test_benchmark_failure_restores_live_service_state(tmp_path: Path) -> None:
+    ohio_root = write_ohio_fixture(tmp_path, patient_ids=("540", "544", "552"), rows=360)
+    service = GlycoGuardService(config=_strict_config(tmp_path))
+    service.ingest_ohio(ohio_root, split="train", prefix="strict", retrain=True, persist=False)
+    original_patient_id = service.default_patient_id
+
+    def broken_sample(*args, **kwargs):
+        raise RuntimeError("benchmark forecast failure")
+
+    service._sample_forecasts = broken_sample  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError):
+        service.benchmark_ohio(ohio_root, max_forecast_points=20)
+
+    assert service.default_patient_id == original_patient_id
+    assert service.is_ready() is True
+    live_report = service.get_report()
+    assert live_report["patient_id"] == original_patient_id
 
 
 def test_prepare_cgm_and_align_context_stay_causal() -> None:
