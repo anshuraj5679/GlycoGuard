@@ -7,10 +7,15 @@ import pandas as pd
 
 
 LIVE_WATCH_FILENAME = "live_watch_payload.json"
+LIVE_REPORT_FILENAME = "live_report_payload.json"
 
 
 def live_watch_path(base_dir: str | Path) -> Path:
     return Path(base_dir) / LIVE_WATCH_FILENAME
+
+
+def live_report_path(base_dir: str | Path) -> Path:
+    return Path(base_dir) / LIVE_REPORT_FILENAME
 
 
 def write_live_watch_payload(base_dir: str | Path, payload: dict[str, object]) -> Path:
@@ -20,8 +25,24 @@ def write_live_watch_payload(base_dir: str | Path, payload: dict[str, object]) -
     return path
 
 
+def write_live_report_payload(base_dir: str | Path, payload: dict[str, object]) -> Path:
+    path = live_report_path(base_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
+
+
 def read_live_watch_payload(base_dir: str | Path, *, max_age_seconds: float = 300.0) -> dict[str, object] | None:
     path = live_watch_path(base_dir)
+    return _read_live_payload(path, max_age_seconds=max_age_seconds)
+
+
+def read_live_report_payload(base_dir: str | Path, *, max_age_seconds: float = 300.0) -> dict[str, object] | None:
+    path = live_report_path(base_dir)
+    return _read_live_payload(path, max_age_seconds=max_age_seconds)
+
+
+def _read_live_payload(path: Path, *, max_age_seconds: float = 300.0) -> dict[str, object] | None:
     if not path.exists():
         return None
 

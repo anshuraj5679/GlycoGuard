@@ -1,5 +1,11 @@
 export type RiskLevel = "LOW" | "MEDIUM" | "HIGH" | "UNKNOWN";
 
+export type ExplanationFactor = {
+  feature: string;
+  contribution: number;
+  message: string;
+};
+
 export type WatchPayload = {
   patient_id: string;
   glucose: number;
@@ -16,6 +22,67 @@ export type WatchPayload = {
   updated_at: string;
   status: string;
   session_id?: string | null;
+};
+
+export type ReportPrediction = {
+  patient_id: string;
+  status: string;
+  current_glucose?: number | null;
+  roc_15?: number | null;
+  hypo_probability?: number | null;
+  risk_level?: RiskLevel | null;
+  predicted_glucose_30min?: number | null;
+  top_reason?: string;
+  watch_status?: string;
+  explanation?: string;
+  top_factors?: ExplanationFactor[];
+};
+
+export type ReportProfile = {
+  patient_id: string;
+  name?: string | null;
+  age?: number | null;
+  diabetes_type?: string | null;
+  insulin_therapy?: string | null;
+};
+
+export type ReportContext = {
+  carbs_1h?: number;
+  carbs_2h?: number;
+  insulin_on_board?: number;
+  activity?: number;
+  sleep_flag?: number;
+  stress_score?: number;
+};
+
+export type AlertLogEntry = {
+  timestamp: string;
+  hypo_probability: number;
+  risk_level: RiskLevel;
+  actual_hypo: boolean;
+};
+
+export type AgpSummary = {
+  mean_glucose?: number;
+  time_in_range?: number;
+  time_below_range?: number;
+  time_above_range?: number;
+  cv?: number;
+  lowest_glucose?: number;
+  highest_glucose?: number;
+};
+
+export type PatientReport = {
+  patient_id: string;
+  profile: ReportProfile;
+  current_glucose: number;
+  roc_15: number;
+  prediction: ReportPrediction;
+  context: ReportContext;
+  alert_log: AlertLogEntry[];
+  agp?: {
+    summary?: AgpSummary;
+  };
 };
 
 export const COLORS = {
@@ -41,6 +108,22 @@ export function buildWatchUrl(apiUrl: string, patientId: string): string {
     return `${baseUrl}/watch/payload`;
   }
   return `${baseUrl}/watch/payload?patient_id=${encodeURIComponent(patientId.trim())}`;
+}
+
+export function buildReportUrl(apiUrl: string, patientId: string): string {
+  const baseUrl = normalizeApiUrl(apiUrl);
+  if (!patientId.trim()) {
+    return `${baseUrl}/report`;
+  }
+  return `${baseUrl}/report/${encodeURIComponent(patientId.trim())}`;
+}
+
+export function buildReportPdfUrl(apiUrl: string, patientId: string): string {
+  const baseUrl = normalizeApiUrl(apiUrl);
+  if (!patientId.trim()) {
+    return `${baseUrl}/report/pdf`;
+  }
+  return `${baseUrl}/report/${encodeURIComponent(patientId.trim())}/pdf`;
 }
 
 export function riskSeverity(level: RiskLevel): number {

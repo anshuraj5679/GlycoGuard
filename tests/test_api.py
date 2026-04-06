@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import pytest
+import pandas as pd
 from conftest import write_ohio_fixture
 from fastapi.testclient import TestClient
 
 from glycoguard.api.main import app
+from glycoguard.live_watch import write_live_report_payload
 from glycoguard.risk import classify_risk
 from glycoguard.service import get_service
 
@@ -201,6 +203,101 @@ def test_real_ingest_report_predict_and_watch_flow(tmp_path) -> None:
     watch_page = client.get("/watch")
     assert watch_page.status_code == 200
     assert "GlycoGuard Watch" in watch_page.text
+
+
+def test_report_pdf_endpoints_return_downloadable_pdf(tmp_path) -> None:
+    _prepare_real_service(tmp_path)
+    patient_id = client.get("/report").json()["patient_id"]
+
+    default_pdf = client.get("/report/pdf")
+    assert default_pdf.status_code == 200
+    assert default_pdf.headers["content-type"].startswith("application/pdf")
+    assert "attachment;" in default_pdf.headers["content-disposition"]
+    assert default_pdf.content.startswith(b"%PDF-1.4")
+
+    patient_pdf = client.get(f"/report/{patient_id}/pdf")
+    assert patient_pdf.status_code == 200
+    assert patient_pdf.headers["content-type"].startswith("application/pdf")
+    assert patient_id in patient_pdf.headers["content-disposition"]
+    assert patient_pdf.content.startswith(b"%PDF-1.4")
+
+
+def test_default_report_and_pdf_follow_live_report_payload(tmp_path) -> None:
+    _prepare_real_service(tmp_path)
+    service = get_service()
+    now = pd.Timestamp.now().isoformat()
+
+    live_report = {
+        "patient_id": "manual-user",
+        "profile": {
+            "patient_id": "manual-user",
+            "name": "Priya",
+            "age": 28,
+            "diabetes_type": "Type 1 diabetes",
+            "insulin_therapy": "Bolus + basal",
+        },
+        "current_glucose": 166.0,
+        "roc_15": -6.0,
+        "prediction": {
+            "patient_id": "manual-user",
+            "status": "ok",
+            "current_glucose": 166.0,
+            "roc_15": -6.0,
+            "hypo_probability": 0.63,
+            "risk_level": "MEDIUM",
+            "predicted_glucose_30min": 84.0,
+            "top_reason": "Glucose dropping 6.0 mg/dL per 15 min",
+            "watch_status": "Watch notified - monitor closely",
+            "explanation": "Recent trend is increasing near-term risk.",
+            "top_factors": [],
+        },
+        "recent_trace": [{"timestamp": now, "glucose": 166.0}],
+        "context": {
+            "carbs_1h": 12.0,
+            "carbs_2h": 12.0,
+            "insulin_on_board": 3.2,
+            "activity": 0.1,
+            "sleep_flag": 0,
+            "stress_score": 0.2,
+        },
+        "agp": {"summary": {"mean_glucose": 140.0, "time_in_range": 0.75}},
+        "alert_log": [],
+        "waterfall": None,
+        "watch": {
+            "patient_id": "manual-user",
+            "glucose": 166.0,
+            "roc_15": -6.0,
+            "trend": "-6.0 mg/dL per 15min",
+            "risk": "MEDIUM",
+            "reason": "Glucose dropping 6.0 mg/dL per 15 min",
+            "buzz": False,
+            "forecast_30min": 84.0,
+            "forecast_warning": "",
+            "hypo_probability": 0.63,
+            "top_reason": "Glucose dropping 6.0 mg/dL per 15 min",
+            "watch_status": "Watch notified - monitor closely",
+            "updated_at": now,
+            "status": "ok",
+        },
+        "benchmark": None,
+        "federated": None,
+        "updated_at": now,
+        "status": "ok",
+    }
+    write_live_report_payload(service.artifact_dir, live_report)
+
+    report = client.get("/report")
+    assert report.status_code == 200
+    body = report.json()
+    assert body["patient_id"] == "manual-user"
+    assert body["current_glucose"] == 166.0
+    assert body["prediction"]["risk_level"] == "MEDIUM"
+
+    default_pdf = client.get("/report/pdf")
+    assert default_pdf.status_code == 200
+    assert b"manual-user" in default_pdf.content
+    assert b"166.00" in default_pdf.content
+    assert b"MEDIUM" in default_pdf.content
 
 
 def test_profile_logging_replay_and_federated_endpoints(tmp_path) -> None:

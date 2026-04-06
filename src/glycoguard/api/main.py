@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 from glycoguard.federated.client import federated_status
 from glycoguard.config import load_config
 from glycoguard.gemini_audit import run_prediction_audit
+from glycoguard.pdf_report import build_report_pdf
 from glycoguard.schemas import (
     AuditRequest,
     ArtifactRequest,
@@ -33,6 +34,19 @@ from glycoguard.service import get_service
 def create_app() -> FastAPI:
     config = load_config("configs/default.yaml")
     app = FastAPI(title=config.api.title, version=config.api.version)
+
+    def pdf_response(report: dict[str, object]) -> Response:
+        patient_id = str(report.get("patient_id") or "patient")
+        payload = build_report_pdf(report)
+        return Response(
+            content=payload,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="glycoguard-report-{patient_id}.pdf"',
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+            },
+        )
 
     @app.get("/health", response_model=HealthResponse)
     def health() -> dict[str, object]:
@@ -142,6 +156,13 @@ def create_app() -> FastAPI:
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+    @app.get("/report/pdf")
+    def default_report_pdf() -> Response:
+        try:
+            return pdf_response(get_service().get_report())
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
     @app.get("/report/{patient_id}")
     def report(patient_id: str) -> dict[str, object]:
         service = get_service()
@@ -149,6 +170,16 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail=f"Unknown patient_id: {patient_id}")
         try:
             return service.get_report(patient_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @app.get("/report/{patient_id}/pdf")
+    def report_pdf(patient_id: str) -> Response:
+        service = get_service()
+        if patient_id not in service.records:
+            raise HTTPException(status_code=404, detail=f"Unknown patient_id: {patient_id}")
+        try:
+            return pdf_response(service.get_report(patient_id))
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 

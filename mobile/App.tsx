@@ -15,10 +15,14 @@ import {
 } from "react-native";
 import * as Notifications from "expo-notifications";
 
+import ReportCard from "./src/ReportCard";
 import RiskCard from "./src/RiskCard";
 import {
   COLORS,
+  PatientReport,
   WatchPayload,
+  buildReportPdfUrl,
+  buildReportUrl,
   buildWatchUrl,
   formatUpdatedAt,
   normalizeApiUrl,
@@ -68,6 +72,17 @@ async function fetchWatchPayload(apiUrl: string, patientId: string): Promise<Wat
     throw new Error(typeof body === "object" && body && "detail" in body && body.detail ? String(body.detail) : "Unable to fetch watch payload.");
   }
   return body as WatchPayload;
+}
+
+async function fetchPatientReport(apiUrl: string, patientId: string): Promise<PatientReport> {
+  const response = await fetch(buildReportUrl(apiUrl, patientId), {
+    headers: { Accept: "application/json" },
+  });
+  const body = (await response.json()) as PatientReport | { detail?: string };
+  if (!response.ok) {
+    throw new Error(typeof body === "object" && body && "detail" in body && body.detail ? String(body.detail) : "Unable to fetch patient report.");
+  }
+  return body as PatientReport;
 }
 
 function shouldNotify(previous: WatchPayload | null, next: WatchPayload): boolean {
@@ -122,8 +137,10 @@ export default function App() {
   const [apiUrl, setApiUrl] = useState(DEFAULT_API_URL);
   const [patientId, setPatientId] = useState(DEFAULT_PATIENT_ID);
   const [payload, setPayload] = useState<WatchPayload | null>(null);
+  const [report, setReport] = useState<PatientReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(DEFAULT_API_URL ? null : "Enter your computer's LAN API URL to connect.");
+  const [reportNote, setReportNote] = useState<string | null>(null);
   const [notificationsEnabled, setNotificationsEnabled] = useState(false);
 
   const lastPayloadRef = useRef<WatchPayload | null>(null);
@@ -140,14 +157,32 @@ export default function App() {
     }
 
     try {
-      const nextPayload = await fetchWatchPayload(normalizedApiUrl, patientId);
-      setPayload(nextPayload);
-      setError(null);
-      if (notificationsEnabled && shouldNotify(lastPayloadRef.current, nextPayload)) {
-        await fireLocalAlert(nextPayload);
+      const [payloadResult, reportResult] = await Promise.allSettled([
+        fetchWatchPayload(normalizedApiUrl, patientId),
+        fetchPatientReport(normalizedApiUrl, patientId),
+      ]);
+
+      if (payloadResult.status === "fulfilled") {
+        const nextPayload = payloadResult.value;
+        setPayload(nextPayload);
+        setError(null);
+        if (notificationsEnabled && shouldNotify(lastPayloadRef.current, nextPayload)) {
+          await fireLocalAlert(nextPayload);
+        }
+        lastPayloadRef.current = nextPayload;
+      } else {
+        throw payloadResult.reason;
       }
-      lastPayloadRef.current = nextPayload;
+
+      if (reportResult.status === "fulfilled") {
+        setReport(reportResult.value);
+        setReportNote(null);
+      } else {
+        setReport(null);
+        setReportNote(reportResult.reason instanceof Error ? reportResult.reason.message : "Patient report is unavailable right now.");
+      }
     } catch (fetchError) {
+      setReport(null);
       setError(fetchError instanceof Error ? fetchError.message : "Unable to reach GlycoGuard.");
     } finally {
       if (showSpinner) {
@@ -155,6 +190,21 @@ export default function App() {
       }
     }
   }, [apiUrl, notificationsEnabled, patientId]);
+
+  const downloadPdf = useCallback(async () => {
+    const normalizedApiUrl = normalizeApiUrl(apiUrl);
+    if (!normalizedApiUrl) {
+      setError("Enter your computer's LAN API URL to connect.");
+      return;
+    }
+    try {
+      const separator = buildReportPdfUrl(normalizedApiUrl, patientId).includes("?") ? "&" : "?";
+      await Linking.openURL(`${buildReportPdfUrl(normalizedApiUrl, patientId)}${separator}ts=${Date.now()}`);
+      setReportNote("Opened the PDF download in your phone browser.");
+    } catch (downloadError) {
+      setReportNote(downloadError instanceof Error ? downloadError.message : "Unable to open the PDF download.");
+    }
+  }, [apiUrl, patientId]);
 
   const enableNotifications = useCallback(async () => {
     const granted = await requestNotificationAccess();
@@ -197,6 +247,8 @@ export default function App() {
     setApiUrl(normalizedApiUrl);
     setPatientId(patientIdDraft.trim());
     setPayload(null);
+    setReport(null);
+    setReportNote(null);
     lastPayloadRef.current = null;
     if (!normalizedApiUrl) {
       setError("Enter your computer's LAN API URL to connect.");
@@ -262,6 +314,12 @@ export default function App() {
           <Pressable onPress={() => Linking.openSettings()}>
             <Text style={styles.metaLink}>Open Android app settings</Text>
           </Pressable>
+
+          <View style={styles.buttonRow}>
+            <Pressable style={styles.primaryButton} onPress={() => void downloadPdf()}>
+              <Text style={styles.primaryButtonText}>Download PDF report</Text>
+            </Pressable>
+          </View>
         </View>
 
         {loading && !payload ? (
@@ -280,11 +338,21 @@ export default function App() {
           </View>
         ) : null}
 
+        {reportNote ? (
+          <View style={styles.infoCard}>
+            <Text style={styles.infoTitle}>Report note</Text>
+            <Text style={styles.infoText}>{reportNote}</Text>
+          </View>
+        ) : null}
+
+        <ReportCard report={report} />
+
         <View style={styles.footerCard}>
           <Text style={styles.footerTitle}>What works now</Text>
           <Text style={styles.footerItem}>- Live polling from your local GlycoGuard API over Wi-Fi</Text>
           <Text style={styles.footerItem}>- Local Android notifications when MEDIUM/HIGH risk escalates</Text>
           <Text style={styles.footerItem}>- Same risk-card styling as the dashboard watch card</Text>
+          <Text style={styles.footerItem}>- Full patient report fetch with PDF download through the mobile app</Text>
           <Text style={styles.footerTitle}>Practical limit</Text>
           <Text style={styles.footerItem}>
             - Near-real-time alerts while the app is open. Reliable background alerts will need FCM or a native foreground service.
@@ -431,6 +499,24 @@ const styles = StyleSheet.create({
   },
   errorText: {
     color: "#7f1d1d",
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  infoCard: {
+    backgroundColor: "#fffaf3",
+    borderRadius: 20,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: "rgba(23,32,45,0.08)",
+    gap: 6,
+  },
+  infoTitle: {
+    color: "#17202d",
+    fontSize: 14,
+    fontWeight: "800",
+  },
+  infoText: {
+    color: "#5f6b7a",
     fontSize: 14,
     lineHeight: 20,
   },

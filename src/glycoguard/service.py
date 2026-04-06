@@ -20,7 +20,7 @@ from glycoguard.federated.client import run_local_simulation
 from glycoguard.ingestion.bundles import discover_bundle_paths, load_patient_bundle
 from glycoguard.ingestion.loader import align_context, prepare_cgm_frame
 from glycoguard.ingestion.ohio import load_ohio_split
-from glycoguard.live_watch import read_live_watch_payload
+from glycoguard.live_watch import read_live_report_payload, read_live_watch_payload
 from glycoguard.models.tft_model import DartsTFTForecaster, ForecastResult, train_tft
 from glycoguard.models.xgboost_model import TabularModelBundle, train_xgboost
 from glycoguard.risk import classify_risk
@@ -1018,6 +1018,10 @@ class GlycoGuardService:
         return prediction
 
     def get_report(self, patient_id: str | None = None) -> dict[str, object]:
+        if patient_id is None:
+            live_report = read_live_report_payload(self.artifact_dir)
+            if live_report is not None:
+                return live_report
         self.ensure_ready(require_patient=True)
         pid = patient_id or self.default_patient_id
         record = self.records[pid]

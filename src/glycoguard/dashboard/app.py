@@ -14,7 +14,7 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     shap = None
 
-from glycoguard.live_watch import write_live_watch_payload
+from glycoguard.live_watch import write_live_report_payload, write_live_watch_payload
 from glycoguard.schemas import CGMInput
 from glycoguard.service import get_service
 
@@ -659,6 +659,75 @@ def _active_watch_payload(
     }
 
 
+def _active_agp_summary(readings: list[float]) -> dict[str, float]:
+    if not readings:
+        return {}
+    values = np.asarray(readings, dtype=float)
+    mean = float(np.mean(values))
+    return {
+        "mean_glucose": mean,
+        "time_in_range": float(np.mean((values >= 70.0) & (values <= 180.0))),
+        "time_below_range": float(np.mean(values < 70.0)),
+        "time_above_range": float(np.mean(values > 180.0)),
+        "cv": float(np.std(values, ddof=0) / max(mean, 1.0)),
+        "lowest_glucose": float(np.min(values)),
+        "highest_glucose": float(np.max(values)),
+    }
+
+
+def _active_report_payload(
+    report: dict[str, object],
+    readings: list[float],
+    prediction: dict[str, object],
+    *,
+    carbs_last_hour: float,
+    insulin_on_board: float,
+    activity_level: float,
+    sleep_flag: bool,
+    stress_score: float,
+    profile: dict[str, object] | None = None,
+) -> dict[str, object]:
+    timestamp = pd.Timestamp(datetime.now()).floor("5min")
+    recent_index = pd.date_range(end=timestamp, periods=len(readings), freq="5min")
+    patient_id = str(prediction.get("patient_id") or report.get("patient_id") or "manual-user")
+    profile_payload = dict(profile or report.get("profile") or {})
+    profile_payload["patient_id"] = patient_id
+    roc_15 = float(readings[-1] - readings[-4]) if len(readings) >= 4 else 0.0
+    watch_payload = _active_watch_payload(readings, prediction, timestamp=timestamp.to_pydatetime(), patient_id=patient_id)
+
+    return {
+        "patient_id": patient_id,
+        "profile": profile_payload,
+        "current_glucose": round(float(readings[-1]), 1) if readings else None,
+        "roc_15": round(roc_15, 1),
+        "prediction": prediction,
+        "recent_trace": [
+            {
+                "timestamp": ts.isoformat(),
+                "glucose": round(float(value), 1),
+            }
+            for ts, value in zip(recent_index, readings)
+        ],
+        "context": {
+            "carbs_1h": round(float(carbs_last_hour), 1),
+            "carbs_2h": round(float(carbs_last_hour), 1),
+            "insulin_on_board": round(float(insulin_on_board), 2),
+            "activity": round(float(activity_level), 2),
+            "sleep_flag": int(bool(sleep_flag)),
+            "stress_score": round(float(stress_score), 2),
+        },
+        "agp": {"summary": _active_agp_summary(readings)},
+        "metrics": report.get("metrics"),
+        "alert_log": report.get("alert_log", []),
+        "waterfall": prediction.get("waterfall") or report.get("waterfall"),
+        "watch": watch_payload,
+        "benchmark": report.get("benchmark"),
+        "federated": report.get("federated"),
+        "updated_at": timestamp.isoformat(),
+        "status": str(prediction.get("status") or "ok"),
+    }
+
+
 def _render_onboarding_mode(service) -> None:
     profile_state = st.session_state.setdefault("profile_draft", _profile_seed(None))
     meal_log = st.session_state.setdefault("local_meal_log", [])
@@ -953,7 +1022,32 @@ def _render_daily_user_mode(service, report: dict[str, object]) -> None:
         active_prediction,
         patient_id=str(active_prediction.get("patient_id") or report["patient_id"]),
     )
+    active_profile = dict(report.get("profile") or {})
+    if str(active_prediction.get("patient_id") or "") == "manual-user":
+        draft = dict(st.session_state.get("profile_draft") or {})
+        active_profile = {
+            "patient_id": "manual-user",
+            "name": draft.get("name"),
+            "age": draft.get("age"),
+            "diabetes_type": draft.get("diabetes_type"),
+            "insulin_therapy": draft.get("insulin_therapy"),
+            "target_range_low": draft.get("target_range_low"),
+            "target_range_high": draft.get("target_range_high"),
+            "weight_kg": draft.get("weight_kg"),
+        }
+    active_report = _active_report_payload(
+        report,
+        active_readings,
+        active_prediction,
+        carbs_last_hour=float(carbs_last_hour),
+        insulin_on_board=float(insulin_on_board),
+        activity_level=float(activity_level),
+        sleep_flag=bool(sleep_flag),
+        stress_score=float(stress_score),
+        profile=active_profile,
+    )
     write_live_watch_payload(service.artifact_dir, active_watch)
+    write_live_report_payload(service.artifact_dir, active_report)
 
     st.caption(input_caption)
     st.markdown(
