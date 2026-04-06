@@ -1,0 +1,38 @@
+{
+  "expo": {
+    "name": "GlycoGuard Mobile",
+    "slug": "glycoguard-mobile",
+    "scheme": "glycoguardmobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": false,
+    "plugins": [
+      [
+        "expo-notifications",
+        {
+          "color": "#0b1220"
+        }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ]
+    ],
+    "android": {
+      "package": "com.glycoguard.mobile",
+      "permissions": [
+        "POST_NOTIFICATIONS"
+      ]
+    },
+    "extra": {
+      "eas": {
+        "projectId": "ec2a970f-ba2e-4f29-8dbf-edb8ea3d6875"
+      }
+    }
+  }
+}

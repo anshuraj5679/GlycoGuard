@@ -105,6 +105,7 @@ def test_active_watch_payload_uses_live_prediction_state() -> None:
         readings=[110.0 + idx for idx in range(20)] + [128.0, 126.0, 124.0, 122.0],
         prediction={
             "status": "ok",
+            "patient_id": "manual-user",
             "risk_level": "HIGH",
             "alert_required": True,
             "watch_buzz": True,
@@ -114,6 +115,7 @@ def test_active_watch_payload_uses_live_prediction_state() -> None:
             "watch_status": "Watch buzz triggered - eat 15g carbs now",
         },
     )
+    assert payload["patient_id"] == "manual-user"
     assert payload["risk"] == "HIGH"
     assert payload["buzz"] is True
     assert "Glucose dropping" in payload["reason"]

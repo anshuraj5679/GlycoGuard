@@ -112,6 +112,10 @@ The command returns JSON with:
 - `audit`: deterministic rule check for risk consistency
 - `gemini_review`: optional Gemini review, with automatic fallback across `GEMINI_API_KEY_1..3`
 
+## Android mobile client
+
+A new Expo-based React Native client lives in [mobile/README.md](/C:/Users/Anshu%20Raj/Desktop/gluco/mobile/README.md). It renders the live watch card from `/watch/payload`, connects to your computer over LAN, and raises local Android notifications when risk escalates.
+
 ## V2 demo flows
 
 Patient setup and low-friction logging:

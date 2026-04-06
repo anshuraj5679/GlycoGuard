@@ -14,6 +14,7 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     shap = None
 
+from glycoguard.live_watch import write_live_watch_payload
 from glycoguard.schemas import CGMInput
 from glycoguard.service import get_service
 
@@ -634,11 +635,13 @@ def _active_watch_payload(
     readings: list[float],
     prediction: dict[str, object],
     timestamp: datetime | None = None,
+    patient_id: str | None = None,
 ) -> dict[str, object]:
     current_glucose = float(readings[-1]) if readings else None
     roc_15 = float(readings[-1] - readings[-4]) if len(readings) >= 4 else 0.0
     risk = prediction.get("risk_level") or "UNKNOWN"
     return {
+        "patient_id": str(patient_id or prediction.get("patient_id") or "manual-user"),
         "glucose": current_glucose,
         "roc_15": roc_15,
         "trend": f"{roc_15:+.1f} mg/dL per 15min",
@@ -945,7 +948,12 @@ def _render_daily_user_mode(service, report: dict[str, object]) -> None:
 
     guidance = _daily_guidance(active_prediction)
     risk_color = _risk_color(active_prediction["risk_level"])
-    active_watch = _active_watch_payload(active_readings, active_prediction)
+    active_watch = _active_watch_payload(
+        active_readings,
+        active_prediction,
+        patient_id=str(active_prediction.get("patient_id") or report["patient_id"]),
+    )
+    write_live_watch_payload(service.artifact_dir, active_watch)
 
     st.caption(input_caption)
     st.markdown(

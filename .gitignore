@@ -13,3 +13,6 @@ data/processed/*.csv
 data/processed/*.parquet
 data/synthetic/*.csv
 artifacts/
+mobile/node_modules/
+mobile/.expo/
+mobile/dist/
